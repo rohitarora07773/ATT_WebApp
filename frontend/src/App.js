@@ -400,7 +400,7 @@ function DashboardLayout({ children }) {
 }
 
 // Dashboard Content Components
-function Dashboard() {
+function Dashboard({ setActiveMenu }) {
   const { user } = useAuth();
 
   return (
@@ -443,7 +443,10 @@ function Dashboard() {
             <Smartphone className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
-            <Button className="w-full bg-blue-600 hover:bg-blue-700">
+            <Button 
+              className="w-full bg-blue-600 hover:bg-blue-700"
+              onClick={() => setActiveMenu && setActiveMenu('att')}
+            >
               Start ATT Unlock
             </Button>
           </CardContent>
