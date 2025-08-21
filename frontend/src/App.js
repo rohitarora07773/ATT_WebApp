@@ -854,10 +854,10 @@ function ChangePassword() {
 }
 
 // Main Content Router
-function MainContent({ activeMenu }) {
+function MainContent({ activeMenu, setActiveMenu }) {
   switch (activeMenu) {
     case 'dashboard':
-      return <Dashboard />;
+      return <Dashboard setActiveMenu={setActiveMenu} />;
     case 'att':
       return <ATTPage />;
     case 'profile':
@@ -865,7 +865,7 @@ function MainContent({ activeMenu }) {
     case 'change-password':
       return <ChangePassword />;
     default:
-      return <Dashboard />;
+      return <Dashboard setActiveMenu={setActiveMenu} />;
   }
 }
 
