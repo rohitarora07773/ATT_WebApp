@@ -2,7 +2,6 @@ from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, UploadFi
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
@@ -15,25 +14,23 @@ import jwt
 import pandas as pd
 import io
 import re
+import asyncpg
+import asyncio
+from contextlib import asynccontextmanager
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
-
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
 
 # JWT Configuration
 JWT_SECRET = os.environ.get('JWT_SECRET', 'your-secret-key-change-in-production')
 JWT_ALGORITHM = 'HS256'
 JWT_EXPIRATION_HOURS = 24
 
-# Create the main app without a prefix
-app = FastAPI()
+# PostgreSQL Configuration
+DATABASE_URL = os.environ.get('DATABASE_URL')
 
-# Create a router with the /api prefix
-api_router = APIRouter(prefix="/api")
+# Database connection pool
+db_pool = None
 
 # Security
 security = HTTPBearer()
@@ -112,17 +109,6 @@ class IMEIInput(BaseModel):
             raise ValueError('IMEI must be exactly 15 digits')
         return v
 
-class ProcessingRequest(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    user_id: str
-    imei: str
-    status: str = "new"  # new, processing, completed, failed
-    request_number: Optional[str] = None
-    response: Optional[str] = None
-    batch_id: Optional[str] = None
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
 class ProcessingResponse(BaseModel):
     id: str
     imei: str
@@ -131,6 +117,46 @@ class ProcessingResponse(BaseModel):
     response: Optional[str]
     created_at: datetime
     updated_at: datetime
+
+# Database initialization
+async def init_database():
+    """Initialize database tables"""
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    
+    async with db_pool.acquire() as conn:
+        # Create users table
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                first_name VARCHAR(100) NOT NULL,
+                last_name VARCHAR(100) NOT NULL,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
+                credits INTEGER DEFAULT 100,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            )
+        ''')
+        
+        # Create processing_requests table
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS processing_requests (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                imei VARCHAR(15) NOT NULL,
+                status VARCHAR(20) DEFAULT 'new',
+                request_number VARCHAR(100),
+                response TEXT,
+                batch_id UUID,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            )
+        ''')
+        
+        # Create indexes for better performance
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_processing_requests_user_id ON processing_requests(user_id)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_processing_requests_status ON processing_requests(status)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_processing_requests_batch_id ON processing_requests(batch_id)')
 
 # Utility Functions
 def hash_password(password: str) -> str:
@@ -153,60 +179,96 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token")
         
-        user = await db.users.find_one({"id": user_id})
-        if not user:
-            raise HTTPException(status_code=401, detail="User not found")
+        async with db_pool.acquire() as conn:
+            user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+            if not user:
+                raise HTTPException(status_code=401, detail="User not found")
         
-        return UserResponse(**user)
+        return UserResponse(
+            id=str(user['id']),
+            first_name=user['first_name'],
+            last_name=user['last_name'],
+            email=user['email'],
+            credits=user['credits'],
+            created_at=user['created_at']
+        )
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+# FastAPI app with lifespan
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await init_database()
+    yield
+    # Shutdown
+    if db_pool:
+        await db_pool.close()
+
+app = FastAPI(lifespan=lifespan)
+
+# Create a router with the /api prefix
+api_router = APIRouter(prefix="/api")
+
 # Authentication Routes
 @api_router.post("/auth/signup")
 async def signup(user_data: UserCreate):
-    # Check if user already exists
-    existing_user = await db.users.find_one({"email": user_data.email})
-    if existing_user:
-        raise HTTPException(status_code=400, detail="User already exists")
-    
-    # Create new user
-    user_id = str(uuid.uuid4())
-    user_dict = {
-        "id": user_id,
-        "first_name": user_data.first_name,
-        "last_name": user_data.last_name,
-        "email": user_data.email,
-        "password_hash": hash_password(user_data.password),
-        "credits": 100,  # Free 100 credits on signup
-        "created_at": datetime.now(timezone.utc)
-    }
-    
-    await db.users.insert_one(user_dict)
-    
-    # Create access token
-    token = create_access_token(user_id)
-    
-    return {
-        "message": "User created successfully",
-        "token": token,
-        "user": UserResponse(**user_dict)
-    }
+    async with db_pool.acquire() as conn:
+        # Check if user already exists
+        existing_user = await conn.fetchrow("SELECT id FROM users WHERE email = $1", user_data.email)
+        if existing_user:
+            raise HTTPException(status_code=400, detail="User already exists")
+        
+        # Create new user
+        user_id = await conn.fetchval('''
+            INSERT INTO users (first_name, last_name, email, password_hash, credits)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id
+        ''', user_data.first_name, user_data.last_name, user_data.email, 
+            hash_password(user_data.password), 100)
+        
+        # Get the created user
+        user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+        
+        # Create access token
+        token = create_access_token(str(user_id))
+        
+        return {
+            "message": "User created successfully",
+            "token": token,
+            "user": UserResponse(
+                id=str(user['id']),
+                first_name=user['first_name'],
+                last_name=user['last_name'],
+                email=user['email'],
+                credits=user['credits'],
+                created_at=user['created_at']
+            )
+        }
 
 @api_router.post("/auth/login")
 async def login(login_data: UserLogin):
-    user = await db.users.find_one({"email": login_data.email.lower()})
-    if not user or not verify_password(login_data.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    
-    token = create_access_token(user["id"])
-    
-    return {
-        "message": "Login successful",
-        "token": token,
-        "user": UserResponse(**user)
-    }
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT * FROM users WHERE email = $1", login_data.email.lower())
+        if not user or not verify_password(login_data.password, user["password_hash"]):
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        
+        token = create_access_token(str(user["id"]))
+        
+        return {
+            "message": "Login successful",
+            "token": token,
+            "user": UserResponse(
+                id=str(user['id']),
+                first_name=user['first_name'],
+                last_name=user['last_name'],
+                email=user['email'],
+                credits=user['credits'],
+                created_at=user['created_at']
+            )
+        }
 
 @api_router.get("/auth/me")
 async def get_current_user_info(current_user: UserResponse = Depends(get_current_user)):
@@ -217,17 +279,18 @@ async def change_password(
     password_data: PasswordChange, 
     current_user: UserResponse = Depends(get_current_user)
 ):
-    user = await db.users.find_one({"id": current_user.id})
-    if not verify_password(password_data.current_password, user["password_hash"]):
-        raise HTTPException(status_code=400, detail="Current password is incorrect")
-    
-    new_password_hash = hash_password(password_data.new_password)
-    await db.users.update_one(
-        {"id": current_user.id},
-        {"$set": {"password_hash": new_password_hash}}
-    )
-    
-    return {"message": "Password changed successfully"}
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT password_hash FROM users WHERE id = $1", current_user.id)
+        if not verify_password(password_data.current_password, user["password_hash"]):
+            raise HTTPException(status_code=400, detail="Current password is incorrect")
+        
+        new_password_hash = hash_password(password_data.new_password)
+        await conn.execute(
+            "UPDATE users SET password_hash = $1 WHERE id = $2",
+            new_password_hash, current_user.id
+        )
+        
+        return {"message": "Password changed successfully"}
 
 # ATT Processing Routes
 @api_router.post("/att/submit-imei")
@@ -235,25 +298,26 @@ async def submit_imei(
     imei_data: IMEIInput,
     current_user: UserResponse = Depends(get_current_user)
 ):
-    # Check if user has credits
-    if current_user.credits <= 0:
-        raise HTTPException(status_code=400, detail="Insufficient credits")
-    
-    # Create processing request
-    request_data = ProcessingRequest(
-        user_id=current_user.id,
-        imei=imei_data.imei
-    )
-    
-    await db.processing_requests.insert_one(request_data.dict())
-    
-    # Deduct credit
-    await db.users.update_one(
-        {"id": current_user.id},
-        {"$inc": {"credits": -1}}
-    )
-    
-    return {"message": "IMEI submitted successfully", "request_id": request_data.id}
+    async with db_pool.acquire() as conn:
+        # Check if user has credits
+        user = await conn.fetchrow("SELECT credits FROM users WHERE id = $1", current_user.id)
+        if user['credits'] <= 0:
+            raise HTTPException(status_code=400, detail="Insufficient credits")
+        
+        # Create processing request
+        request_id = await conn.fetchval('''
+            INSERT INTO processing_requests (user_id, imei, status)
+            VALUES ($1, $2, 'new')
+            RETURNING id
+        ''', current_user.id, imei_data.imei)
+        
+        # Deduct credit
+        await conn.execute(
+            "UPDATE users SET credits = credits - 1 WHERE id = $1",
+            current_user.id
+        )
+        
+        return {"message": "IMEI submitted successfully", "request_id": str(request_id)}
 
 @api_router.post("/att/upload-file")
 async def upload_file(
@@ -288,104 +352,128 @@ async def upload_file(
                 detail=f"Invalid IMEIs found: {invalid_imeis[:10]}{'...' if len(invalid_imeis) > 10 else ''}"
             )
         
-        # Check credits
-        if current_user.credits < len(imei_list):
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Insufficient credits. Required: {len(imei_list)}, Available: {current_user.credits}"
-            )
-        
-        # Create batch
-        batch_id = str(uuid.uuid4())
-        requests = []
-        
-        for imei in imei_list:
-            request_data = ProcessingRequest(
-                user_id=current_user.id,
-                imei=imei,
-                batch_id=batch_id
-            )
-            requests.append(request_data.dict())
-        
-        await db.processing_requests.insert_many(requests)
-        
-        # Deduct credits
-        await db.users.update_one(
-            {"id": current_user.id},
-            {"$inc": {"credits": -len(imei_list)}}
-        )
-        
-        return {
-            "message": f"File uploaded successfully. {len(imei_list)} IMEIs processed.",
-            "batch_id": batch_id,
-            "total_requests": len(imei_list)
-        }
+        async with db_pool.acquire() as conn:
+            # Check credits
+            user = await conn.fetchrow("SELECT credits FROM users WHERE id = $1", current_user.id)
+            if user['credits'] < len(imei_list):
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Insufficient credits. Required: {len(imei_list)}, Available: {user['credits']}"
+                )
+            
+            # Create batch
+            batch_id = str(uuid.uuid4())
+            
+            # Insert all requests in a transaction
+            async with conn.transaction():
+                for imei in imei_list:
+                    await conn.execute('''
+                        INSERT INTO processing_requests (user_id, imei, status, batch_id)
+                        VALUES ($1, $2, 'new', $3)
+                    ''', current_user.id, imei, batch_id)
+                
+                # Deduct credits
+                await conn.execute(
+                    "UPDATE users SET credits = credits - $1 WHERE id = $2",
+                    len(imei_list), current_user.id
+                )
+            
+            return {
+                "message": f"File uploaded successfully. {len(imei_list)} IMEIs processed.",
+                "batch_id": batch_id,
+                "total_requests": len(imei_list)
+            }
         
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error processing file: {str(e)}")
 
 @api_router.get("/att/requests")
 async def get_user_requests(current_user: UserResponse = Depends(get_current_user)):
-    requests = await db.processing_requests.find(
-        {"user_id": current_user.id}
-    ).sort("created_at", -1).to_list(1000)
-    
-    return [ProcessingResponse(**req) for req in requests]
+    async with db_pool.acquire() as conn:
+        requests = await conn.fetch('''
+            SELECT * FROM processing_requests 
+            WHERE user_id = $1 
+            ORDER BY created_at DESC 
+            LIMIT 1000
+        ''', current_user.id)
+        
+        return [ProcessingResponse(
+            id=str(req['id']),
+            imei=req['imei'],
+            status=req['status'],
+            request_number=req['request_number'],
+            response=req['response'],
+            created_at=req['created_at'],
+            updated_at=req['updated_at']
+        ) for req in requests]
 
 @api_router.get("/att/batch/{batch_id}")
 async def get_batch_requests(
     batch_id: str,
     current_user: UserResponse = Depends(get_current_user)
 ):
-    requests = await db.processing_requests.find(
-        {"user_id": current_user.id, "batch_id": batch_id}
-    ).sort("created_at", -1).to_list(1000)
-    
-    if not requests:
-        raise HTTPException(status_code=404, detail="Batch not found")
-    
-    return [ProcessingResponse(**req) for req in requests]
+    async with db_pool.acquire() as conn:
+        requests = await conn.fetch('''
+            SELECT * FROM processing_requests 
+            WHERE user_id = $1 AND batch_id = $2 
+            ORDER BY created_at DESC
+        ''', current_user.id, batch_id)
+        
+        if not requests:
+            raise HTTPException(status_code=404, detail="Batch not found")
+        
+        return [ProcessingResponse(
+            id=str(req['id']),
+            imei=req['imei'],
+            status=req['status'],
+            request_number=req['request_number'],
+            response=req['response'],
+            created_at=req['created_at'],
+            updated_at=req['updated_at']
+        ) for req in requests]
 
 @api_router.get("/att/download/{batch_id}")
 async def download_batch_results(
     batch_id: str,
     current_user: UserResponse = Depends(get_current_user)
 ):
-    requests = await db.processing_requests.find(
-        {"user_id": current_user.id, "batch_id": batch_id}
-    ).to_list(1000)
-    
-    if not requests:
-        raise HTTPException(status_code=404, detail="Batch not found")
-    
-    # Create DataFrame
-    data = []
-    for req in requests:
-        data.append({
-            'IMEI': req['imei'],
-            'Status': req['status'],
-            'Request Number': req.get('request_number', ''),
-            'Response': req.get('response', ''),
-            'Created At': req['created_at'].isoformat(),
-            'Updated At': req['updated_at'].isoformat()
-        })
-    
-    df = pd.DataFrame(data)
-    
-    # Create Excel file in memory
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Results')
-    
-    output.seek(0)
-    
-    from fastapi.responses import StreamingResponse
-    
-    return StreamingResponse(
-        io.BytesIO(output.read()),
-        media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        headers={"Content-Disposition": f"attachment; filename=batch_{batch_id}_results.xlsx"}
-    )
+    async with db_pool.acquire() as conn:
+        requests = await conn.fetch('''
+            SELECT * FROM processing_requests 
+            WHERE user_id = $1 AND batch_id = $2
+        ''', current_user.id, batch_id)
+        
+        if not requests:
+            raise HTTPException(status_code=404, detail="Batch not found")
+        
+        # Create DataFrame
+        data = []
+        for req in requests:
+            data.append({
+                'IMEI': req['imei'],
+                'Status': req['status'],
+                'Request Number': req['request_number'] or '',
+                'Response': req['response'] or '',
+                'Created At': req['created_at'].isoformat(),
+                'Updated At': req['updated_at'].isoformat()
+            })
+        
+        df = pd.DataFrame(data)
+        
+        # Create Excel file in memory
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Results')
+        
+        output.seek(0)
+        
+        from fastapi.responses import StreamingResponse
+        
+        return StreamingResponse(
+            io.BytesIO(output.read()),
+            media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            headers={"Content-Disposition": f"attachment; filename=batch_{batch_id}_results.xlsx"}
+        )
 
 # Include the router in the main app
 app.include_router(api_router)
@@ -404,7 +492,3 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
