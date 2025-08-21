@@ -366,7 +366,7 @@ function DashboardLayout({ children }) {
                     <item.icon className="w-5 h-5" />
                     <span>{item.label}</span>
                   </button>
-                  {item.submenu && activeMenu === item.id && (
+                  {item.submenu && (activeMenu === item.id || item.submenu.some(sub => sub.id === activeMenu)) && (
                     <ul className="ml-8 mt-2 space-y-1">
                       {item.submenu.map((subItem) => (
                         <li key={subItem.id}>
